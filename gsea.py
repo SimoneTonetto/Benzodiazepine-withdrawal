@@ -824,8 +824,15 @@ def make_nes_heatmap(
     display_cutoff: Optional[float] = None,
     display_metric: str = "FDR_q",
     sort_metric: str = DEFAULT_SORT_METRIC,
+    max_rows: Optional[int] = None,
 ) -> None:
-    """Create heatmap of NES values across comparisons, rows ranked by significance."""
+    """
+    Create heatmap of NES values across comparisons, rows ranked by significance.
+
+    top_n selects the most significant pathways *within each contrast*; the
+    union of those selections becomes the row set, so the heatmap normally has
+    more than top_n rows. max_rows trims that union to a fixed total.
+    """
     if all_results is None or all_results.empty:
         print("  [WARN] No results for heatmap")
         return
@@ -887,6 +894,14 @@ def make_nes_heatmap(
         )
     )
     top_paths = row_order["pathway"].tolist()
+
+    # Cap the total number of rows. top_n selects per contrast and the results
+    # are unioned, so with several contrasts the union is usually larger than
+    # top_n; this trims the union to the most significant max_rows overall.
+    if max_rows is not None and max_rows > 0 and len(top_paths) > max_rows:
+        print(f"  Heatmap limited to top {max_rows} of {len(top_paths)} "
+              f"pathways (by {SORT_METRIC_LABELS.get(metric_col, metric_col)})")
+        top_paths = top_paths[:max_rows]
 
     heat_raw = (
         df[df["pathway"].isin(top_paths)]
@@ -1011,7 +1026,11 @@ def make_nes_heatmap(
     ax.tick_params(axis="y", labelsize=HEATMAP_YTICK_FONTSIZE)
     
     metric_label = SORT_METRIC_LABELS.get(metric_col, metric_col)
-    title = f"GSEA NES heatmap (top pathways per contrast, ranked by {metric_label})"
+    if max_rows is not None and max_rows > 0:
+        title = f"GSEA NES heatmap (top {n_rows} pathways by {metric_label})"
+    else:
+        title = ("GSEA NES heatmap (top pathways per contrast, "
+                 f"ranked by {metric_label})")
     if annotate != "none":
         title += f"\nAnnot: {annotate} (≤ {sig_threshold})"
     fig.suptitle(title, fontweight='bold', y=1 - (TITLE_H_IN / fig_h) * 0.35)
@@ -1083,6 +1102,11 @@ Examples:
                     help="Max pathway members detected in the ranked list (default 500)")
     ap.add_argument("--topn", type=int, default=30, 
                     help="Top pathways per contrast carried into figures (default 30)")
+    ap.add_argument("--heatmap-topn", type=int, default=None,
+                    help="Maximum TOTAL rows in the heatmap. --topn selects per "
+                         "contrast and the selections are unioned, so the heatmap "
+                         "is normally larger than --topn; this caps it. "
+                         "Default: no cap.")
     ap.add_argument("--seed", type=int, default=1, 
                     help="Base random seed; set -1 for non-deterministic")
     
@@ -1273,6 +1297,7 @@ Examples:
         display_cutoff=args.heatmap_cutoff,
         display_metric=args.heatmap_cutoff_metric,
         sort_metric=args.sort_metric,
+        max_rows=args.heatmap_topn,
     )
 
     print("\n" + "="*60)
