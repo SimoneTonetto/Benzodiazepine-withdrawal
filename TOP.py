@@ -1,12 +1,58 @@
 #!/usr/bin/env python3
 """
-Identify proteins significantly altered by Alprazolam (Alp+CD vs CD) and
-REVERSED by the knockdown (Alp+KD vs Alp+CD), then visualise the top 50 as a
-z-scored abundance heatmap across the four conditions, annotated with each
-protein's Reactome pathway.
+TOP.py
 
-Top 50 = ranked by combined reversal strength (see RANK_BY below).
+Identify proteins that are significantly altered by alprazolam (Alp+CD vs CD)
+and REVERSED by the knockdown (Alp+KD vs Alp+CD), then visualise the strongest
+of them as annotated heatmap figures.
+
+Selection
+---------
+A protein is kept when it is significant in BOTH contrasts (padj2 < ALPHA in
+each) and its log2 fold changes have OPPOSITE signs between them. Survivors are
+ranked by RANK_BY:
+
+  "reversal"  |log2FC_alp| + |log2FC_kd|   both directions weighted equally
+  "alp"       |log2FC_alp| only
+
+and the top TOP_N (default 50; set to 0 or None to keep all) are plotted.
+Note that ranking is by effect size, not by significance: padj2 is used as a
+gate, not as a sort key.
+
+Annotation
+----------
+Each protein is labelled with one pathway term. Reactome is the primary source
+(tagged TAG_REACTOME); the optional GO Biological Process map is consulted only
+for proteins Reactome does not annotate (tagged TAG_GO). Set GO_FALLBACK_FILE
+to None to disable the fallback. Where a protein maps to several terms, the
+first alphabetically is displayed — see first_pathway().
+
+Inputs
+------
+- INPUT_FILE          regulation table (TSV), long format, one row per
+                      protein per contrast. Required columns:
+                      identifier, display_name, comparison, log2FC, padj2,
+                      group1, group2, mean(group1), mean(group2)
+- ANNOTATION_FILE     Reactome map (TSV) with ANNOTATION_KEY + ANNOTATION_COL
+- GO_FALLBACK_FILE    GO-BP map (TSV) with GO_KEY + GO_COL, or None
+
+Outputs (all prefixed with OUTPUT_PREFIX)
+-----------------------------------------
+- _top<TOP_N>_reverse_regulated.tsv     the plotted subset, with annotation
+- _all_reverse_regulated.tsv            every reverse-regulated protein
+- _heatmap_2comparisons.png             log2FC | genes | z-score | pathway,
+                                        the two reversal contrasts
+- _heatmap_4comparisons.png             as above, all four contrasts
+- _heatmap_2comparisons_noZ.png         log2FC | genes | pathway (no z-score)
+
+Parameters are set in the USER PARAMETERS block below, and every one of them
+can be overridden on the command line; run with --help for the full list.
 """
+from __future__ import annotations
+
+import argparse
+import textwrap
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,7 +62,8 @@ import seaborn as sns
 
 # ---------------------------------------------------------------------
 # Global font settings  <<< CHANGE FONT SIZES HERE >>>
-# (same block as Volcano_plot.py / pca_samples_advanced.py — keep in sync)
+# Mirrors the block in gsea4.py; keep the two in sync so figures from the
+# two scripts sit together in a figure panel without restyling.
 # ---------------------------------------------------------------------
 
 plt.rcParams.update({
@@ -56,10 +103,10 @@ PATHWAY_LABEL_FONTSIZE   = 10     # pathway text, one per row
 # Long pathway names
 # ---------------------------------------------------------------------
 # Pathway terms are often far too long for one line, so they are wrapped onto
-# several lines (same idea as the GSEA heatmap). Unlike the GSEA heatmap the
-# row height here is fixed (one row per protein), so the number of lines is
-# capped — anything longer is truncated with an ellipsis rather than running
-# into the neighbouring rows.
+# several lines. Unlike the GSEA heatmap in gsea4.py, the row height here is
+# fixed at one row per protein, so the number of lines is capped — anything
+# longer is truncated with an ellipsis rather than running into neighbouring
+# rows.
 
 PATHWAY_WRAP_WIDTH  = 35     # characters per line before wrapping
 PATHWAY_MAX_LINES   = 2      # max lines per row (extra text is truncated)
@@ -75,8 +122,6 @@ def wrap_pathway(text: str,
     The trailing source tag ('[R]' / '[GO]') is kept attached to the last line
     so it is never orphaned or cut off by the truncation.
     """
-    import textwrap
-
     text = str(text).strip()
     if not text:
         return ""
@@ -127,10 +172,12 @@ TAG_REACTOME = "[R]"
 TAG_GO = "[GO]"
 
 ALPHA = 0.05                        # padj2 significance threshold (both contrasts)
-TOP_N = 50                          # top proteins (reverse-regulated) to plot
+TOP_N = 50                          # proteins to plot; 0 or None keeps all
 OUTPUT_PREFIX = "alprazolam_direction_switch"
 
-# How to rank the reverse-regulated proteins for the "top N":
+# How to rank the reverse-regulated proteins for the "top N". Both options rank
+# by EFFECT SIZE; padj2 has already served as a gate at this point and is not
+# used as a sort key.
 #   "reversal"  -> |log2FC_alp| + |log2FC_kd|  (strongest in BOTH directions)
 #   "alp"       -> |log2FC_alp_vs_ctrl| only   (original behaviour)
 RANK_BY = "reversal"
@@ -170,9 +217,50 @@ FIG2_COMPARISONS = [
 # ============================================================
 
 
+REQUIRED_INPUT_COLS = [
+    "identifier", "display_name", "comparison", "log2FC", "padj2",
+    "group1", "group2", "mean(group1)", "mean(group2)",
+]
+
+
 def clean_cols(df):
     df.columns = [str(c).strip() for c in df.columns]
     return df
+
+
+def require_columns(df, cols, path):
+    """Fail early with a readable message rather than deep inside plotting."""
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise SystemExit(
+            f"'{path}' is missing required column(s): {', '.join(missing)}\n"
+            f"Columns found: {', '.join(map(str, df.columns))}"
+        )
+
+
+def fmt_padj(v):
+    """Format an adjusted p-value for display inside a heatmap cell."""
+    if pd.isna(v):
+        return ""
+    if v == 0:
+        return "< 0.0001"
+    return f"{v:.2g}"
+
+
+def format_padj_table(padj):
+    """
+    Elementwise-format a padj DataFrame.
+
+    DataFrame.applymap was deprecated in pandas 2.1 and removed in 3.0;
+    DataFrame.map replaces it. Prefer the current name and fall back for
+    pandas < 2.1.
+    """
+    if hasattr(padj, "map"):
+        try:
+            return padj.map(fmt_padj)
+        except TypeError:
+            pass
+    return padj.applymap(fmt_padj)
 
 
 def main():
@@ -180,6 +268,7 @@ def main():
     # LOAD MAIN DATA + CLEAN IDENTIFIERS
     # ========================================================
     df = clean_cols(pd.read_csv(INPUT_FILE, sep="\t"))
+    require_columns(df, REQUIRED_INPUT_COLS, INPUT_FILE)
 
     # identifier is "SYMBOL~UNIPROT"; keep the UniProt part as the unique id,
     # but also keep the gene symbol (already in display_name) for annotation.
@@ -269,6 +358,12 @@ def main():
           f"down→up: {(reverse['direction_pattern']=='down_in_alp_up_in_kd').sum()})")
 
     top = reverse.head(TOP_N).copy() if TOP_N else reverse.copy()
+    if top.empty:
+        raise SystemExit(
+            "No reverse-regulated proteins found. Check that ALPHA "
+            f"({ALPHA}) is not too strict and that the contrast names "
+            f"'{C_ALP_VS_CTRL}' and '{C_KD_VS_ALP}' match the data."
+        )
     print(f"Plotting top {len(top)} proteins")
 
     # attach pathway annotation: Reactome first, GO fallback, with source tag
@@ -276,9 +371,12 @@ def main():
     top["pathway"] = [p for p, _ in ann_pairs]
     top["annotation_source"] = [src for _, src in ann_pairs]
 
-    # save tables
-    top.to_csv(f"{OUTPUT_PREFIX}_top{TOP_N}_reverse_regulated.tsv", sep="\t", index=False)
-    reverse.to_csv(f"{OUTPUT_PREFIX}_all_reverse_regulated.tsv", sep="\t", index=False)
+    # save tables. The count in the filename is how many were actually kept,
+    # so TOP_N = 0/None (keep all) does not produce a "top0_" file.
+    top_tsv = f"{OUTPUT_PREFIX}_top{len(top)}_reverse_regulated.tsv"
+    all_tsv = f"{OUTPUT_PREFIX}_all_reverse_regulated.tsv"
+    top.to_csv(top_tsv, sep="\t", index=False)
+    reverse.to_csv(all_tsv, sep="\t", index=False)
 
     n_r = (top["annotation_source"] == TAG_REACTOME).sum()
     n_g = (top["annotation_source"] == TAG_GO).sum()
@@ -315,6 +413,14 @@ def main():
     row_syms = [sym_map.get(k, k) for k in order]
 
     def first_pathway(s):
+        """
+        Return the single term to display for a protein.
+
+        Terms were joined by load_gene_to_terms() in sorted order, so this is
+        the ALPHABETICALLY first term, not the most specific or most
+        significant one. It is a display convenience for a one-line-per-protein
+        figure; the full set is retained in the output TSVs.
+        """
         if not isinstance(s, str) or not s.strip():
             return ""
         return s.split(";")[0].strip()
@@ -350,14 +456,7 @@ def main():
         comp_labels = [COMPARISON_RENAME.get(c, c) for c in comps]
 
         # padj2 numbers as cell annotations; exact 0 shown as "< 0.0001"
-        def fmt_padj(v):
-            if pd.isna(v):
-                return ""
-            if v == 0:
-                return "< 0.0001"
-            return f"{v:.2g}"
-        annot = (padj.applymap(fmt_padj).values if hasattr(padj, "applymap")
-                 else padj.map(fmt_padj))
+        annot = format_padj_table(padj)
 
         n = len(order)
         n_comp = len(comps)
@@ -389,7 +488,7 @@ def main():
 
         # --- panel 1: log2FC heatmap with padj2 numbers, colour bar on LEFT ---
         vmax = np.nanmax(np.abs(lfc.values)) if np.isfinite(lfc.values).any() else 1.0
-        hm1 = sns.heatmap(
+        sns.heatmap(
             lfc, ax=ax_lfc, cmap="RdBu_r", center=0,
             vmin=-vmax, vmax=vmax,
             xticklabels=comp_labels, yticklabels=False,
@@ -418,7 +517,7 @@ def main():
             ax_z, width="4%", height="40%", loc="center right",
             bbox_to_anchor=(0.10, 0.0, 1, 1), bbox_transform=ax_z.transAxes,
             borderpad=0)
-        hm2 = sns.heatmap(
+        sns.heatmap(
             z, ax=ax_z, cmap="coolwarm", center=0,
             xticklabels=col_labels, yticklabels=False,
             linewidths=0.4, linecolor="white",
@@ -473,14 +572,7 @@ def main():
         padj = padj_by_comp.loc[order, comps]
         comp_labels = [COMPARISON_RENAME.get(c, c) for c in comps]
 
-        def fmt_padj(v):
-            if pd.isna(v):
-                return ""
-            if v == 0:
-                return "< 0.0001"
-            return f"{v:.2g}"
-        annot = (padj.applymap(fmt_padj).values if hasattr(padj, "applymap")
-                 else padj.map(fmt_padj))
+        annot = format_padj_table(padj)
 
         n = len(order)
         n_comp = len(comps)
@@ -545,8 +637,8 @@ def main():
         print(f"  {out_png}")
 
     print("\nSaved:")
-    print(f"  {OUTPUT_PREFIX}_top{TOP_N}_reverse_regulated.tsv")
-    print(f"  {OUTPUT_PREFIX}_all_reverse_regulated.tsv")
+    print(f"  {top_tsv}")
+    print(f"  {all_tsv}")
     make_three_panel(
         FIG1_COMPARISONS,
         f"{OUTPUT_PREFIX}_heatmap_2comparisons.png",
@@ -561,5 +653,78 @@ def main():
         "reversal comparisons (log2FC only)")
 
 
+def parse_args(argv=None):
+    """
+    Optional command-line overrides.
+
+    Every default is the corresponding constant in the USER PARAMETERS block,
+    so running with no arguments reproduces the in-file configuration exactly.
+    """
+    ap = argparse.ArgumentParser(
+        description="Find and plot proteins reversed by the knockdown: "
+                    "significant in both contrasts, with opposite log2FC signs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              # Use the settings in the USER PARAMETERS block
+              python TOP.py
+
+              # A different region, keeping everything else
+              python TOP.py --input regulation_table_Amygdala.tsv \\
+                            --output-prefix alprazolam_switch_Amygdala
+
+              # Every reverse-regulated protein, Reactome annotation only
+              python TOP.py --top-n 0 --go-fallback none
+            """),
+    )
+    ap.add_argument("--input", default=INPUT_FILE,
+                    help="Regulation table (TSV), long format")
+    ap.add_argument("--annotation", default=ANNOTATION_FILE,
+                    help="Reactome gene-to-pathway map (TSV)")
+    ap.add_argument("--go-fallback", default=GO_FALLBACK_FILE,
+                    help="GO-BP map (TSV) used only where Reactome is silent; "
+                         "pass 'none' to disable")
+    ap.add_argument("--output-prefix", default=OUTPUT_PREFIX,
+                    help="Prefix for all output files")
+    ap.add_argument("--alpha", type=float, default=ALPHA,
+                    help="padj2 threshold, applied to BOTH contrasts")
+    ap.add_argument("--top-n", type=int, default=TOP_N,
+                    help="Proteins to plot; 0 keeps all")
+    ap.add_argument("--rank-by", default=RANK_BY, choices=["reversal", "alp"],
+                    help="Effect-size score used to pick the top N")
+    ap.add_argument("--annotation-key", default=ANNOTATION_KEY,
+                    help="Gene-symbol column in the Reactome map")
+    ap.add_argument("--annotation-col", default=ANNOTATION_COL,
+                    help="Pathway-term column in the Reactome map")
+    ap.add_argument("--go-key", default=GO_KEY,
+                    help="Gene-symbol column in the GO map")
+    ap.add_argument("--go-col", default=GO_COL,
+                    help="Pathway-term column in the GO map")
+    return ap.parse_args(argv)
+
+
+def apply_args(args):
+    """Push parsed arguments onto the module-level parameters."""
+    global INPUT_FILE, ANNOTATION_FILE, GO_FALLBACK_FILE, OUTPUT_PREFIX
+    global ALPHA, TOP_N, RANK_BY
+    global ANNOTATION_KEY, ANNOTATION_COL, GO_KEY, GO_COL
+
+    INPUT_FILE = args.input
+    ANNOTATION_FILE = args.annotation
+    GO_FALLBACK_FILE = (
+        None if str(args.go_fallback).strip().lower() in ("none", "")
+        else args.go_fallback
+    )
+    OUTPUT_PREFIX = args.output_prefix
+    ALPHA = args.alpha
+    TOP_N = args.top_n
+    RANK_BY = args.rank_by
+    ANNOTATION_KEY = args.annotation_key
+    ANNOTATION_COL = args.annotation_col
+    GO_KEY = args.go_key
+    GO_COL = args.go_col
+
+
 if __name__ == "__main__":
+    apply_args(parse_args())
     main()
