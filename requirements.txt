@@ -1,5 +1,10 @@
+# Required by both gsea.py and TOP.py
 numpy>=1.24
 pandas>=2.0
 matplotlib>=3.7
+
+# Required by TOP.py; gsea.py skips its heatmap with a warning if absent
 seaborn>=0.13
+
+# Optional: permutation progress bars in gsea.py
 tqdm>=4.66
