@@ -1,36 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gsea_optimized.py
+gsea.py
 
-Optimized standalone pre-ranked GSEA with keyword filtering.
+Standalone pre-ranked Gene Set Enrichment Analysis (GSEA) for quantitative
+proteomics, with Reactome pathway support and optional restriction of figures
+to a chosen branch of the Reactome hierarchy.
 
-Key improvements:
-- Vectorized operations for better performance
-- Better memory management
-- Enhanced error handling and validation
-- Progress indicators for long-running operations
-- Parallel processing option for multiple comparisons
-- Improved code documentation
+For each contrast, proteins are ranked by the chosen statistic, every pathway
+meeting a detected-size threshold is tested by permutation, and results are
+written alongside NES barplots, enrichment curves and a cross-contrast heatmap.
+
+Behaviour notes
+---------------
+- Results, barplots and heatmap rows are ranked by BH-adjusted permutation
+  p-value (BH_q) by default; use --sort-metric to rank by FDR_q or pval
+  instead. Ties are broken by nominal p, then |NES| descending, then pathway
+  name, which matters because permutation p-values are floored at
+  1 / (nperm + 1) and top pathways frequently share an adjusted value.
+- Both BH_q (Benjamini-Hochberg on nominal permutation p-values) and FDR_q
+  (GSEA-style empirical FDR from the pooled null NES) are reported.
+- Hierarchy filtering via --ancestors is applied only after testing and
+  multiple-testing correction; it changes which pathways are plotted, never
+  the statistics or the size of the tested pathway universe.
+- Ranking ties and per-contrast seeds are handled deterministically, so runs
+  are reproducible unless --seed is set to -1.
 
 Outputs
 -------
 - gsea_results.csv                 (all tested pathways across comparisons)
 - gsea_leading_edge.csv            (leading-edge members for each pathway/comparison)
-- gsea_results_filtered.csv        (optional: filtered view used for plots)
+- gsea_results_filtered.csv        (the subset used for plots)
 - gsea_nes_barplot__<comparison>.png
 - gsea_enrichment__<pathway>__<comparison>.png
 - gsea_nes_heatmap.png
 
 Usage example
 -------------
-python gsea_optimized.py \
+python gsea.py \
   --reg-table regulation_table_Amygdala.tsv \
   --pathway-map reactome_map_mouse.tsv \
   --id-col display_name --stat-col log2FC \
   --comparisons "Alprazolam_KD vs Alprazolam, Alprazolam vs Control" \
   --outdir GSEA_out_Amygdala \
-  --nperm 500 --min-size 10 --topn 30 --seed 1 \
+  --nperm 1000 --min-size 10 --topn 30 --seed 1 \
   --hierarchy reactome_hierarchy_mouse.tsv \
   --ancestors "R-MMU-112316,R-MMU-1428517"
 """
@@ -65,39 +78,31 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------
-# Global font settings  <<< CHANGE FONT SIZES HERE >>>
-# (same block as Volcano_plot.py / pca_samples_advanced.py — keep in sync)
+# Global font settings
 # ---------------------------------------------------------------------
 
 plt.rcParams.update({
     "font.family":      "sans-serif",
     "font.sans-serif":  ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"],
-    "font.size":        10,   # baseline (fallback for anything not set below)
-    "axes.labelsize":   14,   # x/y axis labels
-    "axes.titlesize":   14,   # per-axes title
-    "figure.titlesize": 14,   # fig.suptitle (used by the heatmap)
-    "xtick.labelsize":  12,   # numbers on the x axis
-    "ytick.labelsize":  12,   # numbers on the y axis
-    "legend.fontsize":  12,   # legend text
+    "font.size":        10,
+    "axes.labelsize":   14,
+    "axes.titlesize":   14,
+    "figure.titlesize": 14,
+    "xtick.labelsize":  12,
+    "ytick.labelsize":  12,
+    "legend.fontsize":  12,
     "legend.title_fontsize": 12,
-    # Keep text as real text (not outlines) in SVG/PDF so it stays editable
-    # in Inkscape / Word / PowerPoint. Set to "path" if fonts look wrong on
-    # another computer.
     "svg.fonttype":     "none",
-    "pdf.fonttype":     42,   # TrueType in the PDF (editable text, not bitmaps)
+    "pdf.fonttype":     42,
 })
 
 # ---------------------------------------------------------------------
 # Heatmap-specific font sizes
 # ---------------------------------------------------------------------
-# The NES heatmap packs many small cells, so its text does NOT follow the
-# global sizes above — 12 pt annotations would overlap and the wrapped pathway
-# names would not fit the reserved left margin. Tune these separately.
-
-HEATMAP_ANNOT_FONTSIZE  = 8    # p-value / FDR numbers inside the cells
-HEATMAP_XTICK_FONTSIZE  = 10    # comparison labels under the heatmap
-HEATMAP_YTICK_FONTSIZE  = 10    # wrapped pathway names on the left
-CBAR_TICK_FONTSIZE      = 12    # colour-bar tick numbers
+HEATMAP_ANNOT_FONTSIZE  = 8
+HEATMAP_XTICK_FONTSIZE  = 10
+HEATMAP_YTICK_FONTSIZE  = 10
+CBAR_TICK_FONTSIZE      = 12
 
 
 # -----------------------------
@@ -136,7 +141,6 @@ def read_table(path: str) -> pd.DataFrame:
         elif path_lower.endswith('.csv'):
             return pd.read_csv(path)
         else:
-            # Try TSV first, then CSV
             try:
                 return pd.read_csv(path, sep="\t")
             except Exception:
@@ -146,11 +150,7 @@ def read_table(path: str) -> pd.DataFrame:
 
 
 def bh_fdr(pvals: np.ndarray) -> np.ndarray:
-    """
-    Benjamini-Hochberg FDR correction.
-    
-    Optimized version with better handling of edge cases.
-    """
+    """Benjamini-Hochberg correction of nominal p-values."""
     p = np.asarray(pvals, dtype=float)
     n = p.size
     
@@ -166,23 +166,94 @@ def bh_fdr(pvals: np.ndarray) -> np.ndarray:
     p_ok = p[ok]
     n_ok = p_ok.size
     
-    # Sort and calculate FDR
     idx = np.argsort(p_ok)
     p_sorted = p_ok[idx]
     ranks = np.arange(1, n_ok + 1, dtype=float)
     
-    # Vectorized FDR calculation
     q_sorted = p_sorted * (n_ok / ranks)
-    
-    # Ensure monotonicity (reverse cumulative minimum)
     q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
     q_sorted = np.clip(q_sorted, 0.0, 1.0)
     
-    # Map back to original order
     q_ok = np.empty_like(p_ok)
     q_ok[idx] = q_sorted
     q[ok] = q_ok
     
+    return q
+
+
+def gsea_fdr_from_nes(
+    observed_nes: np.ndarray,
+    null_nes_by_pathway: Dict[str, np.ndarray],
+    pathway_names: List[str],
+) -> np.ndarray:
+    """
+    Calculate empirical GSEA-style FDR from observed and null NES.
+
+    Positive and negative enrichment tails are treated separately.
+    The null tail probability is compared with the corresponding
+    observed NES tail probability, following the standard GSEA FDR idea.
+    """
+    obs = np.asarray(observed_nes, dtype=float)
+    q = np.full(obs.shape, np.nan, dtype=float)
+    valid = np.isfinite(obs)
+    if not np.any(valid):
+        return q
+
+    names = [pathway_names[i] for i in np.flatnonzero(valid)]
+
+    null_parts = []
+    for p in names:
+        x = np.asarray(null_nes_by_pathway.get(p, []), dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size:
+            null_parts.append(x)
+
+    if not null_parts:
+        return q
+
+    null_all = np.concatenate(null_parts)
+    ov = obs[valid]
+    qv = np.full(ov.shape, np.nan, dtype=float)
+
+    # Positive NES tail.
+    pos = ov >= 0
+    if np.any(pos):
+        null_pos = null_all[null_all >= 0]
+        if null_pos.size:
+            idx = np.flatnonzero(pos)
+            order = idx[np.argsort(ov[idx])]
+            xs = ov[order]
+
+            null_tail = np.array(
+                [(np.sum(null_pos >= x) + 1.0) / (null_pos.size + 1.0) for x in xs]
+            )
+            obs_tail = np.array(
+                [np.sum(ov[pos] >= x) / float(np.sum(pos)) for x in xs]
+            )
+            vals = null_tail / obs_tail
+            vals = np.minimum.accumulate(vals[::-1])[::-1]
+            qv[order] = vals
+
+    # Negative NES tail.
+    neg = ov < 0
+    if np.any(neg):
+        null_neg = null_all[null_all <= 0]
+        if null_neg.size:
+            idx = np.flatnonzero(neg)
+            order = idx[np.argsort(ov[idx])[::-1]]
+            xs = ov[order]
+
+            null_tail = np.array(
+                [(np.sum(null_neg <= x) + 1.0) / (null_neg.size + 1.0) for x in xs]
+            )
+            obs_tail = np.array(
+                [np.sum(ov[neg] <= x) / float(np.sum(neg)) for x in xs]
+            )
+            vals = null_tail / obs_tail
+            vals = np.minimum.accumulate(vals[::-1])[::-1]
+            qv[order] = vals
+
+    q[valid] = np.clip(qv, 0.0, 1.0)
     return q
 
 
@@ -203,6 +274,59 @@ def sanitize_filename(s: str, max_len: int = 180) -> str:
     return s[:max_len] if len(s) > max_len else s
 
 
+DEFAULT_SORT_METRIC = "BH_q"
+SORT_METRIC_LABELS = {
+    "BH_q": "BH-adjusted p",
+    "FDR_q": "GSEA FDR q",
+    "pval": "nominal p",
+}
+
+
+def resolve_sort_metric(df: pd.DataFrame, metric: str = DEFAULT_SORT_METRIC) -> str:
+    """Return a usable sorting metric, falling back if the column is absent."""
+    if df is not None and metric in df.columns:
+        return metric
+    for fallback in ("BH_q", "FDR_q", "pval"):
+        if df is not None and fallback in df.columns:
+            if fallback != metric:
+                print(f"  [WARN] sort metric '{metric}' not available; using '{fallback}'")
+            return fallback
+    return metric
+
+
+def sort_by_significance(
+    df: pd.DataFrame,
+    metric: str = DEFAULT_SORT_METRIC,
+    group_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Sort results ascending by the chosen significance metric.
+
+    Ties are broken by nominal p-value, then |NES| (descending), then pathway
+    name so the ordering is fully deterministic. Missing values sort last.
+    """
+    if df is None or df.empty:
+        return df
+
+    metric = resolve_sort_metric(df, metric)
+    work = df.copy()
+    def _num(col: str) -> pd.Series:
+        if col in work.columns:
+            return pd.to_numeric(work[col], errors="coerce")
+        return pd.Series(np.nan, index=work.index, dtype=float)
+
+    work["_metric"] = _num(metric)
+    work["_pval"] = _num("pval")
+    work["_absnes"] = _num("NES").abs()
+
+    group_cols = list(group_cols or [])
+    by = group_cols + ["_metric", "_pval", "_absnes", "pathway"]
+    asc = [True] * len(group_cols) + [True, True, False, True]
+
+    work = work.sort_values(by=by, ascending=asc, kind="mergesort", na_position="last")
+    return work.drop(columns=["_metric", "_pval", "_absnes"]).reset_index(drop=True)
+
+
 def star(p: float) -> str:
     """Convert p-value to significance stars."""
     if not np.isfinite(p):
@@ -217,7 +341,7 @@ def star(p: float) -> str:
 
 
 # -----------------------------
-# GSEA core - Optimized
+# GSEA core
 # -----------------------------
 
 def compute_es_from_hits(
@@ -225,11 +349,7 @@ def compute_es_from_hits(
     hit_weights: np.ndarray, 
     N: int
 ) -> float:
-    """
-    Compute enrichment score from hit positions and weights.
-    
-    Optimized with vectorized operations.
-    """
+    """Compute enrichment score from hit positions and weights."""
     k = int(hit_positions.size)
     if k == 0 or k == N:
         return np.nan
@@ -240,12 +360,10 @@ def compute_es_from_hits(
     if not np.isfinite(NR) or NR <= 0:
         return np.nan
 
-    # Vectorized running sum calculation
     p_hit = np.cumsum(w) / NR
     p_miss = (hit_positions - np.arange(k, dtype=float)) / float(N - k)
     running = p_hit - p_miss
 
-    # Find max deviation
     max_es = float(np.nanmax(running))
     min_es = float(np.nanmin(running))
     
@@ -261,22 +379,29 @@ def preranked_gsea_one_comparison(
     seed: Optional[int] = 1,
     weight_p: float = 1.0,
     show_progress: bool = True,
+    sort_metric: str = DEFAULT_SORT_METRIC,
 ) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
-    """
-    Perform pre-ranked GSEA for one comparison.
-    
-    Optimized with better memory management and optional progress bars.
-    """
+    """Perform pre-ranked GSEA for one comparison."""
     rng = np.random.default_rng(None if seed is None else int(seed))
 
-    # Prepare ranked list
+    # Prepare ranked list with duplicate aggregation
     ranked = ranked.dropna()
     ranked.index = ranked.index.map(normalize_id)
     ranked = ranked.groupby(level=0).mean()
-    ranked = ranked.sort_values(ascending=False)
 
-    ids = ranked.index.to_numpy()
-    stats = ranked.to_numpy(dtype=float)
+    # Create DataFrame to perform multi-key deterministic tie-breaking
+    df_ranked = pd.DataFrame({'stat': ranked.values, 'id': ranked.index})
+    df_ranked['abs_stat'] = df_ranked['stat'].abs()
+    
+    # Sort deterministically: primary by stat (descending), secondary by abs(stat), tertiary by ID
+    df_ranked = df_ranked.sort_values(
+        by=['stat', 'abs_stat', 'id'],
+        ascending=[False, False, True],
+        kind='mergesort'
+    ).reset_index(drop=True)
+
+    ids = df_ranked['id'].to_numpy()
+    stats = df_ranked['stat'].to_numpy(dtype=float)
     N = stats.size
     
     if N < 2:
@@ -329,14 +454,22 @@ def preranked_gsea_one_comparison(
             p_hit = np.cumsum(w) / NR
             p_miss = (hit_pos - np.arange(k, dtype=float)) / float(N - k)
             running = p_hit - p_miss
-            peak_i = int(np.nanargmax(running)) if es >= 0 else int(np.nanargmin(running))
-            le = ";".join(p_members_id[p][: peak_i + 1].tolist())
+            
+            # Corrected leading edge calculation for positive vs negative ES
+            if es >= 0:
+                peak_i = int(np.nanargmax(running))
+                le_members = p_members_id[p][: peak_i + 1]
+            else:
+                peak_i = int(np.nanargmin(running))
+                le_members = p_members_id[p][peak_i:]
+                
+            le = ";".join(le_members.tolist())
 
         obs.append((p, float(es), int(k), le))
 
     obs_df = pd.DataFrame(obs, columns=["pathway", "ES", "size", "leading_edge"])
 
-    # Permutation testing - Optimized
+    # Permutation testing
     print(f"  → Running {nperm} permutations...")
     null_es: Dict[str, np.ndarray] = {
         p: np.empty(nperm, dtype=float) for p in obs_df["pathway"]
@@ -344,21 +477,16 @@ def preranked_gsea_one_comparison(
     
     base_indices = np.arange(N, dtype=int)
     
-    # Progress bar for permutations
     perm_iter = range(nperm)
     if HAS_TQDM and show_progress:
         perm_iter = tqdm(perm_iter, desc="  Permutations", leave=False)
     
     for b in perm_iter:
-        # Generate permutation
         perm = rng.permutation(base_indices)
-        
-        # Compute inverse permutation efficiently
         invperm = np.empty_like(perm)
         invperm[perm] = base_indices
         w_perm = w_all[perm]
 
-        # Compute null ES for each pathway
         for p, idxs in p_members_idx.items():
             pos = invperm[idxs].astype(int)
             order = np.argsort(pos)
@@ -394,17 +522,18 @@ def preranked_gsea_one_comparison(
 
         rows.append((p, es, nes, pval, k, le))
 
-    # Create results dataframe
     res = pd.DataFrame(
         rows, 
         columns=["pathway", "ES", "NES", "pval", "size", "leading_edge"]
     )
-    res["FDR_q"] = bh_fdr(res["pval"].to_numpy())
-    res = res.sort_values(
-        ["FDR_q", "pval", "NES", "pathway"], 
-        ascending=[True, True, False, True], 
-        kind="mergesort"
-    ).reset_index(drop=True)
+    res["FDR_q"] = gsea_fdr_from_nes(
+        observed_nes=res["NES"].to_numpy(),
+        null_nes_by_pathway=null_es,
+        pathway_names=res["pathway"].tolist(),
+    )
+    # Keep BH-adjusted nominal permutation p-values separately.
+    res["BH_q"] = bh_fdr(res["pval"].to_numpy())
+    res = sort_by_significance(res, metric=sort_metric)
 
     debug = {
         "ranked_ids": ids, 
@@ -443,7 +572,6 @@ def load_pathway_map(
     
     df = df[[pathway_col, member_col]].dropna()
     
-    # Group by pathway
     pathways: Dict[str, List[str]] = {}
     for p, sub in df.groupby(pathway_col):
         pathways[str(p)] = sub[member_col].astype(str).tolist()
@@ -456,11 +584,7 @@ def load_pathway_id_map(
     pathway_col: Optional[str] = None,
     id_col: str = "reactome_id",
 ) -> Dict[str, str]:
-    """Load a pathway-name -> Reactome-ID lookup from the map file.
-
-    Returns {} if the map has no id column (e.g. an older map without IDs), in
-    which case hierarchy filtering simply won't be available.
-    """
+    """Load a pathway-name -> Reactome-ID lookup from the map file."""
     df = read_table(path)
     if pathway_col is None:
         pathway_col = df.columns[0]
@@ -485,7 +609,6 @@ def load_ranked_from_reg_table(
     """Load ranked gene lists from regulation table."""
     df = read_table(path)
     
-    # Validate required columns
     for col in (comparison_col, id_col, stat_col):
         if col not in df.columns:
             raise ValueError(
@@ -498,12 +621,10 @@ def load_ranked_from_reg_table(
     df[stat_col] = pd.to_numeric(df[stat_col], errors="coerce")
     df = df.dropna(subset=[comparison_col, id_col, stat_col])
 
-    # Filter by comparisons if specified
     if comparisons:
         keep = set([c.strip() for c in comparisons if c.strip()])
         df = df[df[comparison_col].astype(str).isin(keep)]
 
-    # Group by comparison
     ranked_by_comp: Dict[str, pd.Series] = {}
     for comp, sub in df.groupby(comparison_col):
         s = sub.groupby(id_col)[stat_col].mean()
@@ -517,11 +638,7 @@ def load_ranked_from_reg_table(
 # -----------------------------
 
 def load_hierarchy(path: Optional[str]) -> Optional[pd.DataFrame]:
-    """Load the Reactome hierarchy file produced by build_hierarchy.py.
-
-    Expected columns: reactome_id, display_name, parent_id, ancestor_ids,
-    ancestor_names. Returns None if no path is given or the file is missing.
-    """
+    """Load Reactome hierarchy file."""
     if not path:
         return None
     if not os.path.exists(path):
@@ -536,7 +653,7 @@ def load_hierarchy(path: Optional[str]) -> Optional[pd.DataFrame]:
 
 
 def resolve_ancestor_ids(hierarchy: pd.DataFrame, ancestors: List[str]) -> set:
-    """Resolve a list of ancestor IDs or names to a set of Reactome IDs."""
+    """Resolve ancestor IDs or names to Reactome IDs."""
     if hierarchy is None:
         return set()
     name_to_id = {
@@ -560,11 +677,11 @@ def resolve_ancestor_ids(hierarchy: pd.DataFrame, ancestors: List[str]) -> set:
 
 
 def pathways_under(hierarchy: pd.DataFrame, ancestors: List[str]) -> set:
-    """Return the set of Reactome IDs that ARE, or descend from, any ancestor."""
+    """Return Reactome IDs descending from any ancestor."""
     wanted = resolve_ancestor_ids(hierarchy, ancestors)
     if not wanted:
         return set()
-    keep = set(wanted)  # ancestors themselves count
+    keep = set(wanted)
     for rid, anc in zip(hierarchy["reactome_id"], hierarchy["ancestor_ids"]):
         anc_ids = set(str(anc).split(";")) if anc else set()
         if anc_ids & wanted:
@@ -577,16 +694,11 @@ def filter_results_for_plots(
     hierarchy: Optional[pd.DataFrame] = None,
     ancestors: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Filter GSEA result rows to pathways under the given ancestor(s).
-
-    Matching is by the `reactome_id` column threaded through from the map. If no
-    ancestors are requested, the input is returned unchanged.
-    """
+    """Filter GSEA result rows to pathways under given ancestor(s)."""
     if not ancestors or hierarchy is None:
         return df
     if "reactome_id" not in df.columns:
-        print("  [WARN] results have no 'reactome_id' column; cannot filter by "
-              "hierarchy. Is your map missing Reactome IDs?")
+        print("  [WARN] results have no 'reactome_id' column; cannot filter by hierarchy.")
         return df
     keep_ids = pathways_under(hierarchy, ancestors)
     if not keep_ids:
@@ -598,30 +710,30 @@ def make_nes_barplot(
     res: pd.DataFrame, 
     outdir: str, 
     comparison: str, 
-    top_n: int = 20
+    top_n: int = 20,
+    sort_metric: str = DEFAULT_SORT_METRIC,
 ) -> None:
-    """Create horizontal barplot of NES values."""
+    """Create horizontal barplot of NES values, ranked by significance."""
     if res is None or res.empty:
         return
     
-    sub = res.sort_values(
-        ["FDR_q", "pval", "NES", "pathway"], 
-        ascending=[True, True, False, True], 
-        kind="mergesort"
-    ).head(top_n).copy()
+    sub = sort_by_significance(res, metric=sort_metric).head(top_n).copy()
     
-    # Reverse for better visualization
+    # Reverse so the most significant pathway ends up at the top of the axis.
     sub = sub.iloc[::-1]
 
     fig, ax = plt.subplots(figsize=(9, max(3.5, 0.35 * len(sub))))
     
-    # Color bars by direction
     colors = ['red' if x < 0 else 'blue' for x in sub["NES"]]
     ax.barh(sub["pathway"], sub["NES"], color=colors, alpha=0.7)
     ax.axvline(0, color='black', linewidth=1, linestyle='--')
     
-    # Font sizes come from the rcParams block at the top of this file
-    ax.set_title(f"GSEA NES — {comparison}", fontweight='bold')
+    metric_used = resolve_sort_metric(res, sort_metric)
+    ax.set_title(
+        f"GSEA NES — {comparison}\n"
+        f"top {len(sub)} by {SORT_METRIC_LABELS.get(metric_used, metric_used)}",
+        fontweight='bold'
+    )
     ax.set_xlabel("NES")
     ax.set_ylabel("")
     
@@ -644,7 +756,7 @@ def plot_enrichment_curve(
     weight_p: float = 1.0,
     title_extra: str = "",
 ) -> None:
-    """Plot enrichment curve for a single pathway."""
+    """Plot enrichment curve for a single pathway using deterministically sorted ranks."""
     ids = np.array([normalize_id(x) for x in ranked_ids], dtype=object)
     stat = np.asarray(ranked_stats, dtype=float)
     N = stat.size
@@ -663,7 +775,6 @@ def plot_enrichment_curve(
     if not np.isfinite(NR) or NR <= 0:
         return
 
-    # Calculate running enrichment score
     P_hit = np.zeros(N, dtype=float)
     P_miss = np.zeros(N, dtype=float)
     P_hit[hit_mask] = hit_w / NR
@@ -674,11 +785,9 @@ def plot_enrichment_curve(
     es_neg = float(np.min(running))
     es = es_pos if abs(es_pos) >= abs(es_neg) else es_neg
 
-    # Plot
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5), 
                                     gridspec_kw={'height_ratios': [3, 1]})
     
-    # Enrichment curve
     ax1.plot(running, linewidth=2, color='green' if es > 0 else 'red')
     ax1.axhline(0, color='black', linewidth=1, linestyle='--')
     ax1.set_ylabel("Running enrichment score")
@@ -687,7 +796,6 @@ def plot_enrichment_curve(
     )
     ax1.grid(True, alpha=0.3)
     
-    # Hit positions
     hit_positions = np.where(hit_mask)[0]
     ax2.vlines(hit_positions, 0, 1, colors='black', linewidths=0.5)
     ax2.set_xlim(0, N)
@@ -715,16 +823,9 @@ def make_nes_heatmap(
     p_fmt: str = ".2g",
     display_cutoff: Optional[float] = None,
     display_metric: str = "FDR_q",
+    sort_metric: str = DEFAULT_SORT_METRIC,
 ) -> None:
-    """
-    Create heatmap of NES values across comparisons.
-    
-    Improved version with better handling of missing values and aesthetics.
-
-    display_cutoff: if set, only pathways whose `display_metric` is <= this value
-        in AT LEAST ONE comparison are shown. Applied before the top_n cap.
-    display_metric: which column the cutoff applies to ('FDR_q' or 'pval').
-    """
+    """Create heatmap of NES values across comparisons, rows ranked by significance."""
     if all_results is None or all_results.empty:
         print("  [WARN] No results for heatmap")
         return
@@ -734,16 +835,15 @@ def make_nes_heatmap(
         return
 
     df = all_results.copy()
-    df["FDR_q"] = pd.to_numeric(df["FDR_q"], errors="coerce")
-    df["pval"] = pd.to_numeric(df["pval"], errors="coerce")
-    df["NES"] = pd.to_numeric(df["NES"], errors="coerce")
+    for col in ("FDR_q", "BH_q", "pval", "NES"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Optional significance cutoff: keep only pathways passing the threshold in
-    # at least one comparison (before the top_n selection below).
+    metric_col = resolve_sort_metric(df, sort_metric)
+
     if display_cutoff is not None:
         if display_metric not in df.columns:
-            print(f"  [WARN] display_metric '{display_metric}' not in results; "
-                  f"skipping cutoff.")
+            print(f"  [WARN] display_metric '{display_metric}' not in results; skipping cutoff.")
         else:
             passing = (
                 df.loc[df[display_metric] <= display_cutoff, "pathway"]
@@ -755,16 +855,11 @@ def make_nes_heatmap(
             print(f"  Heatmap cutoff {display_metric} <= {display_cutoff}: "
                   f"{df['pathway'].nunique()}/{n_before} pathways kept")
             if df.empty:
-                print("  [WARN] No pathways pass the heatmap display cutoff; "
-                      "skipping heatmap.")
+                print("  [WARN] No pathways pass the heatmap display cutoff; skipping heatmap.")
                 return
 
-    # Sort and select top pathways
-    df_sorted = df.sort_values(
-        by=["comparison", "FDR_q", "pval", "NES", "pathway"],
-        ascending=[True, True, True, False, True],
-        kind="mergesort",
-    )
+    # Pick the top_n most significant pathways within each contrast.
+    df_sorted = sort_by_significance(df, metric=metric_col, group_cols=["comparison"])
 
     top_paths = (
         df_sorted.groupby("comparison", sort=True, group_keys=False)
@@ -772,20 +867,36 @@ def make_nes_heatmap(
         .dropna()
         .unique()
     )
-    top_paths = sorted(top_paths)
 
-    # Create NES matrix
+    # Order the heatmap rows by each pathway's best (smallest) value of the
+    # sorting metric across all contrasts, so the most significant sit on top.
+    sub = df[df["pathway"].isin(top_paths)]
+    row_order = (
+        sub.groupby("pathway")
+        .agg(
+            _metric=(metric_col, "min"),
+            _pval=("pval", "min"),
+            _absnes=("NES", lambda s: s.abs().max()),
+        )
+        .reset_index()
+        .sort_values(
+            by=["_metric", "_pval", "_absnes", "pathway"],
+            ascending=[True, True, False, True],
+            kind="mergesort",
+            na_position="last",
+        )
+    )
+    top_paths = row_order["pathway"].tolist()
+
     heat_raw = (
         df[df["pathway"].isin(top_paths)]
         .pivot(index="pathway", columns="comparison", values="NES")
         .reindex(index=top_paths)
     ).sort_index(axis=1)
 
-    # Apply pretty labels
     col_map = {c: pretty_comp(c) for c in heat_raw.columns}
     heat = heat_raw.rename(columns=col_map)
 
-    # Prepare annotations
     annot_tbl = None
     if annotate != "none":
         if annotate == "stars":
@@ -804,8 +915,12 @@ def make_nes_heatmap(
                 lambda x: star(x) if (pd.notna(x) and x <= sig_threshold) else ""
             )
 
-        elif annotate in ("fdr", "pval"):
-            metric = "FDR_q" if annotate == "fdr" else "pval"
+        elif annotate in ("fdr", "bh", "pval"):
+            metric = (
+                "FDR_q" if annotate == "fdr"
+                else "BH_q" if annotate == "bh"
+                else "pval"
+            )
             vals_raw = (
                 df[df["pathway"].isin(top_paths)]
                 .pivot(index="pathway", columns="comparison", values=metric)
@@ -822,9 +937,6 @@ def make_nes_heatmap(
                 lambda x: format(float(x), p_fmt) if pd.notna(x) else ""
             )
 
-    # Wrap long pathway (y-axis) names onto multiple lines so they don't run off
-    # the figure. The index holds full pathway NAMES (never Reactome IDs), so the
-    # heatmap always shows readable names.
     import textwrap
     wrap_width = 45
     wrapped_index = {
@@ -835,21 +947,15 @@ def make_nes_heatmap(
     if annot_tbl is not None:
         annot_tbl = annot_tbl.rename(index=wrapped_index)
 
-    # ------------------------------------------------------------------
-    # Fixed cell size: each cell is a constant CELL_W_IN x CELL_H_IN inches,
-    # regardless of how many comparisons or pathways there are. The figure
-    # grows to fit; the cells never stretch or shrink. Set the two equal for
-    # squares, or different for rectangles (e.g. wide-and-short cells).
-    # ------------------------------------------------------------------
     n_rows = heat.shape[0]
     n_cols = heat.shape[1]
 
-    CELL_W_IN = 1.25        # width of each cell (inches)
-    CELL_H_IN = 0.25        # height of each cell (inches)
-    LABEL_W_IN = 5.5        # left margin reserved for (wrapped) pathway names
-    LABEL_H_IN = 1.6        # bottom margin reserved for comparison labels
-    CBAR_W_IN = 1.0         # right margin for the colour bar
-    TITLE_H_IN = 1.0        # top margin for the title
+    CELL_W_IN = 1.25
+    CELL_H_IN = 0.25
+    LABEL_W_IN = 5.5
+    LABEL_H_IN = 1.6
+    CBAR_W_IN = 1.0
+    TITLE_H_IN = 1.0
 
     grid_w = n_cols * CELL_W_IN
     grid_h = n_rows * CELL_H_IN
@@ -871,17 +977,12 @@ def make_nes_heatmap(
         ax=ax
     )
 
-    # Pin the axes rectangle so the cell area is exactly grid_w x grid_h inches
-    # and the label/title margins are constant across different-sized heatmaps.
     left = LABEL_W_IN / fig_w
     bottom = LABEL_H_IN / fig_h
     width = grid_w / fig_w
     height = grid_h / fig_h
     ax.set_position([left, bottom, width, height])
 
-    # Move the colour bar into the reserved right margin (set_position above only
-    # moves the main axes, so the cbar must be repositioned to match). Make it
-    # the SAME height as the grid, and tick every integer (so ±1, ±2, ... show).
     if ax.collections and ax.collections[0].colorbar is not None:
         cbar = ax.collections[0].colorbar
         cbar_ax = cbar.ax
@@ -889,13 +990,12 @@ def make_nes_heatmap(
         cbar_w = 0.22 / fig_w
         cbar_ax.set_position([cbar_left, bottom, cbar_w, height])
 
-        # Integer ticks spanning the colour scale, always including +/-1.
         import numpy as _np
         vmin, vmax = ax.collections[0].get_clim()
         lo = int(_np.floor(vmin))
         hi = int(_np.ceil(vmax))
         ticks = list(range(lo, hi + 1))
-        for t in (-1, 1):                 # guarantee +/-1 even if rounding skips them
+        for t in (-1, 1):
             if vmin <= t <= vmax and t not in ticks:
                 ticks.append(t)
         ticks = sorted(t for t in ticks if vmin <= t <= vmax)
@@ -906,27 +1006,17 @@ def make_nes_heatmap(
     ax.set_xlabel("")
     ax.set_ylabel("")
 
-    # Smaller, non-overlapping x-axis (comparison) labels; stagger every other
-    # one downward so neighbouring long names don't collide.
     xlabels = [t.get_text() for t in ax.get_xticklabels()]
-    ax.set_xticklabels(xlabels, fontsize=HEATMAP_XTICK_FONTSIZE,
-                       rotation=0, ha="center")
-    #for i, tick in enumerate(ax.get_xticklabels()):
-     #   if i % 2 == 1:
-      #      tick.set_y(tick.get_position()[1] - 0.03)
-
+    ax.set_xticklabels(xlabels, fontsize=HEATMAP_XTICK_FONTSIZE, rotation=0, ha="center")
     ax.tick_params(axis="y", labelsize=HEATMAP_YTICK_FONTSIZE)
     
-    title = "GSEA NES heatmap (top pathways per contrast)"
+    metric_label = SORT_METRIC_LABELS.get(metric_col, metric_col)
+    title = f"GSEA NES heatmap (top pathways per contrast, ranked by {metric_label})"
     if annotate != "none":
         title += f"\nAnnot: {annotate} (≤ {sig_threshold})"
-    # Center the title over the whole figure rather than just the grid.
-    fig.suptitle(title, fontweight='bold',
-                 y=1 - (TITLE_H_IN / fig_h) * 0.35)   # size: rcParams["figure.titlesize"]
+    fig.suptitle(title, fontweight='bold', y=1 - (TITLE_H_IN / fig_h) * 0.35)
     
     out_png = os.path.join(outdir, "gsea_nes_heatmap.png")
-    # NOTE: no tight_layout()/bbox_inches='tight' here — those would rescale the
-    # carefully fixed cell geometry. Save at the exact figure size instead.
     plt.savefig(out_png, dpi=300)
     plt.close()
     
@@ -939,16 +1029,26 @@ def make_nes_heatmap(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Optimized pre-ranked GSEA with keyword filtering.",
+        description="Pre-ranked GSEA for quantitative proteomics, with optional "
+                    "Reactome hierarchy filtering of figures.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python gsea_optimized.py \\
+  python gsea.py \\
     --reg-table regulation_table.tsv \\
     --pathway-map reactome_map.tsv \\
     --id-col gene --stat-col log2FC \\
     --outdir GSEA_output \\
     --nperm 1000 --topn 30
+
+  # Restrict figures to two Reactome branches (statistics unaffected):
+  python gsea.py \\
+    --reg-table regulation_table.tsv \\
+    --pathway-map reactome_map.tsv \\
+    --id-col gene --stat-col log2FC \\
+    --outdir GSEA_output \\
+    --hierarchy reactome_hierarchy_mouse.tsv \\
+    --ancestors "R-MMU-112316,R-MMU-1428517"
         """
     )
     
@@ -965,7 +1065,7 @@ Examples:
                     help="Column name for contrast labels in reg table")
     ap.add_argument("--id-col", default="gene", 
                     help="Column name for IDs in reg table (gene/protein)")
-    ap.add_argument("--stat-col", default="log2FC", 
+    ap.add_argument("--stat-col", default="T-statistics", 
                     help="Column name for ranking statistic in reg table")
     ap.add_argument("--comparisons", default="", 
                     help="Comma-separated list of comparisons to run (optional)")
@@ -978,39 +1078,37 @@ Examples:
     ap.add_argument("--nperm", type=int, default=1000, 
                     help="Number of permutations (default 1000)")
     ap.add_argument("--min-size", type=int, default=10, 
-                    help="Min overlap size for pathway (default 10)")
+                    help="Min pathway members detected in the ranked list (default 10)")
     ap.add_argument("--max-size", type=int, default=500, 
-                    help="Max overlap size for pathway (default 500)")
+                    help="Max pathway members detected in the ranked list (default 500)")
     ap.add_argument("--topn", type=int, default=30, 
-                    help="Top pathways per contrast for plots (default 30)")
+                    help="Top pathways per contrast carried into figures (default 30)")
     ap.add_argument("--seed", type=int, default=1, 
                     help="Base random seed; set -1 for non-deterministic")
     
     # Plotting parameters
-    ap.add_argument("--heatmap-annot", default="fdr", 
-                    choices=["fdr", "pval", "stars", "none"], 
-                    help="Heatmap annotations")
+    ap.add_argument("--heatmap-annot", default="bh", 
+                    choices=["fdr", "bh", "pval", "stars", "none"], 
+                    help="Value printed in heatmap cells (default bh)")
     ap.add_argument("--sig-threshold", type=float, default=0.05, 
-                    help="Annotation threshold for heatmap")
+                    help="Only annotate heatmap cells at or below this value (default 0.05)")
     ap.add_argument("--p-fmt", default=".2g", 
                     help="Format for p/q annotation")
     ap.add_argument("--heatmap-cutoff", type=float, default=None,
-                    help="If set, the heatmap shows only pathways meeting this "
-                         "significance threshold (on --heatmap-cutoff-metric) in "
-                         "at least one comparison. E.g. 0.1")
-    ap.add_argument("--heatmap-cutoff-metric", default="FDR_q",
-                    choices=["FDR_q", "pval"],
-                    help="Metric the --heatmap-cutoff applies to (default FDR_q)")
+                    help="Drop pathways from the heatmap above this value (default: keep all)")
+    ap.add_argument("--heatmap-cutoff-metric", default="BH_q",
+                    choices=["BH_q", "FDR_q", "pval"],
+                    help="Metric the --heatmap-cutoff applies to (default BH_q)")
+    ap.add_argument("--sort-metric", default="BH_q",
+                    choices=["BH_q", "FDR_q", "pval"],
+                    help="Metric used to rank results, barplots and heatmap rows "
+                         "(default BH_q = BH-corrected permutation p-value)")
     
-    # Filtering (by Reactome hierarchy)
+    # Filtering
     ap.add_argument("--ancestors", default="",
-                    help="Comma-separated Reactome ancestor IDs or names. Plots/"
-                         "filtered output keep only pathways that ARE or descend "
-                         "from these. E.g. 'R-MMU-112316' (Neuronal System) or "
-                         "'R-MMU-112316,R-MMU-1428517'. Empty = keep all.")
+                    help="Comma-separated Reactome ancestor IDs or names. Filters figures only, after correction; statistics are unaffected.")
     ap.add_argument("--hierarchy", default="",
-                    help="Path to reactome_hierarchy_mouse.tsv (from "
-                         "build_hierarchy.py). Required when --ancestors is set.")
+                    help="Reactome hierarchy file with reactome_id and ancestor_ids columns; required by --ancestors.")
     
     # Other options
     ap.add_argument("--no-progress", action="store_true",
@@ -1018,36 +1116,27 @@ Examples:
 
     args = ap.parse_args()
     
-    # Setup
     outdir = ensure_outdir(args.outdir)
     show_progress = not args.no_progress and HAS_TQDM
     
-    # Parse hierarchy filtering options
     ancestors = [a.strip() for a in args.ancestors.split(",") if a.strip()]
     hierarchy = load_hierarchy(args.hierarchy) if ancestors else None
     if ancestors and hierarchy is None:
-        print("  [WARN] --ancestors set but no usable --hierarchy; "
-              "filtering disabled (all pathways kept).")
+        print("  [WARN] --ancestors set but no usable --hierarchy; filtering disabled.")
         ancestors = []
 
     comps = [c.strip() for c in args.comparisons.split(",") if c.strip()] if args.comparisons else None
     pathway_col = args.pathway_col.strip() or None
     member_col = args.member_col.strip() or None
 
-    # Load pathway map
     print("\n" + "="*60)
     print("LOADING PATHWAY MAP")
     print("="*60)
     pathways = load_pathway_map(args.pathway_map, pathway_col=pathway_col, member_col=member_col)
     print(f"✓ Loaded {len(pathways)} pathways")
 
-    # Pathway-name -> Reactome ID lookup (for hierarchy filtering); {} if absent
     pathway_ids = load_pathway_id_map(args.pathway_map, pathway_col=pathway_col)
-    if ancestors and not pathway_ids:
-        print("  [WARN] map has no 'reactome_id' column; hierarchy filtering "
-              "will keep all pathways. Rebuild the map with reactome_map.py.")
 
-    # Load ranked lists
     print("\n" + "="*60)
     print("LOADING RANKED LISTS")
     print("="*60)
@@ -1064,7 +1153,6 @@ Examples:
     
     print(f"✓ Found {len(ranked_by_comp)} comparison(s): {list(ranked_by_comp.keys())}")
 
-    # Run GSEA
     print("\n" + "="*60)
     print("RUNNING GSEA")
     print("="*60)
@@ -1076,7 +1164,6 @@ Examples:
         print(f"\n[{i}/{len(ranked_by_comp)}] Processing: {comp}")
         print(f"  Genes in ranked list: {len(ranked)}")
         
-        # Generate reproducible seed for this comparison
         base_seed = None if (args.seed is None or int(args.seed) < 0) else int(args.seed)
         comp_seed = None if base_seed is None else (base_seed + (stable_hash_int(comp) % 1_000_000_000))
 
@@ -1089,6 +1176,7 @@ Examples:
             seed=comp_seed,
             weight_p=1.0,
             show_progress=show_progress,
+            sort_metric=args.sort_metric,
         )
         
         if res.empty:
@@ -1099,32 +1187,34 @@ Examples:
         res["reactome_id"] = res["pathway"].map(pathway_ids).fillna("")
         all_rows.append(res)
 
-        # Leading edge
-        le = res[["pathway", "comparison", "leading_edge", "NES", "FDR_q", "pval", "size"]].copy()
+        le = res[["pathway", "comparison", "leading_edge", "NES", "FDR_q", "BH_q", "pval", "size"]].copy()
         leading_edge_rows.append(le)
 
-        # Filter for plotting
         plot_res = filter_results_for_plots(res, hierarchy=hierarchy, ancestors=ancestors)
         
         if plot_res.empty:
             print(f"  [INFO] No pathways match hierarchy filter for plots")
             continue
 
-        # Create barplot
-        make_nes_barplot(plot_res, outdir, pretty_comp(comp), top_n=min(int(args.topn), 50))
+        make_nes_barplot(
+            plot_res, outdir, pretty_comp(comp),
+            top_n=min(int(args.topn), 50),
+            sort_metric=args.sort_metric,
+        )
 
-        # Create enrichment curves for top pathways
-        top_plot = plot_res.sort_values(
-            ["FDR_q", "pval", "NES", "pathway"],
-            ascending=[True, True, False, True],
-            kind="mergesort"
+        top_plot = sort_by_significance(
+            plot_res, metric=args.sort_metric
         ).head(min(int(args.topn), 20))
         
         print(f"  Creating {len(top_plot)} enrichment curves...")
         for _, row in top_plot.iterrows():
             p = row["pathway"]
             members = pathways.get(p, [])
-            extra = f" NES={row['NES']:.3g}  q={row['FDR_q']:.3g}"
+            extra = (
+                f" NES={row['NES']:.3g}"
+                f"  BH q={row['BH_q']:.3g}"
+                f"  GSEA q={row['FDR_q']:.3g}"
+            )
             plot_enrichment_curve(
                 ranked_ids=debug["ranked_ids"],
                 ranked_stats=debug["ranked_stats"],
@@ -1138,31 +1228,37 @@ Examples:
     if not all_rows:
         raise SystemExit("\n✗ No GSEA results produced for any comparison.")
 
-    # Save results
     print("\n" + "="*60)
     print("SAVING RESULTS")
     print("="*60)
     
     all_res = pd.concat(all_rows, ignore_index=True)
+    all_res = sort_by_significance(
+        all_res, metric=args.sort_metric, group_cols=["comparison"]
+    )
     out_csv = os.path.join(outdir, "gsea_results.csv")
     all_res.to_csv(out_csv, index=False)
     print(f"✓ Wrote: {out_csv}")
 
     if leading_edge_rows:
         le_all = pd.concat(leading_edge_rows, ignore_index=True)
+        le_all = sort_by_significance(
+            le_all, metric=args.sort_metric, group_cols=["comparison"]
+        )
         out_le = os.path.join(outdir, "gsea_leading_edge.csv")
         le_all.to_csv(out_le, index=False)
         print(f"✓ Wrote: {out_le}")
 
-    # Filtered results for plots
     viz_res = filter_results_for_plots(all_res, hierarchy=hierarchy, ancestors=ancestors)
+    viz_res = sort_by_significance(
+        viz_res, metric=args.sort_metric, group_cols=["comparison"]
+    )
     print(f"\nPathways: all={all_res['pathway'].nunique()}, filtered={viz_res['pathway'].nunique()}")
     
     out_filt = os.path.join(outdir, "gsea_results_filtered.csv")
     viz_res.to_csv(out_filt, index=False)
     print(f"✓ Wrote: {out_filt}")
 
-    # Heatmap across contrasts
     print("\n" + "="*60)
     print("CREATING HEATMAP")
     print("="*60)
@@ -1176,6 +1272,7 @@ Examples:
         p_fmt=args.p_fmt,
         display_cutoff=args.heatmap_cutoff,
         display_metric=args.heatmap_cutoff_metric,
+        sort_metric=args.sort_metric,
     )
 
     print("\n" + "="*60)
